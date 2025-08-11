@@ -1,0 +1,223 @@
+---
+title: "Visium HD Mouse Brain Analysis with Seurat and BANKSY"
+author: "Copy form Seurat tutorial"
+date: "2025-08-10"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+1. Install and Load required libraries
+
+```{r}
+# packages required for Visium HD
+#install.packages("hdf5r")
+#install.packages("arrow")
+
+library(Seurat)
+library(SeuratData)
+library(ggplot2)
+library(patchwork)
+library(dplyr)
+
+```
+```{r}
+
+# Load required libraries
+library(DropletUtils)
+library(Seurat)
+library(hdf5r)
+library(arrow)
+```
+
+2. Data Setup
+Download the Visium HD 3' Mouse Brain dataset from 10x Genomics:
+https://www.10xgenomics.com/datasets/visium-hd-three-prime-mouse-brain-fresh-frozen
+
+Store the data in the folder `VisiumHD_mouse_brain`.
+
+```{r}
+# Set working directory to where data is stored
+#setwd("~/Desktop/VisiumHD_mouse_brain")
+
+# Attempt to load data (will fail if required files are missing)
+#localdir <- "/brahms/lis/visium_hd/mouse/new_mousebrain/"
+
+#object <- Load10X_Spatial(data.dir = localdir, bin.size = c(8, 16))
+
+```
+This will produce: Error in FUN(X[[i]], ...): File not found
+Cause: 'filtered_feature_bc_matrix.h5' is not found in the specified directory.
+Solution: Unzip the `Visium_HD_3prime_Mouse_Brain_binned_outputs.tar.gz` file.
+
+```{r}
+## Load Processed Binned Output again
+setwd("~/Desktop/VisiumHD_mouse_brain/binned_outputs/square_008um")
+
+data.dir <- "~/Desktop/VisiumHD_mouse_brain/binned_outputs/square_008um"
+
+object <- Load10X_Spatial(
+  data.dir = data.dir,
+  filename = "filtered_feature_bc_matrix.h5",
+  assay = "Spatial",
+  filter.matrix = TRUE
+)
+
+## Data Inspection & Visualization
+
+# Confirm default assay
+Assays(object)
+DefaultAssay(object) <- "Spatial"
+
+# Visualize counts
+vln.plot <- VlnPlot(object, features = "nCount_Spatial", pt.size = 0) + 
+  theme(axis.text = element_text(size = 4)) + NoLegend()
+count.plot <- SpatialFeaturePlot(object, features = "nCount_Spatial") + 
+  theme(legend.position = "right")
+
+vln.plot | count.plot
+```
+
+3. Normalize and Explore Expression
+
+```{r}
+object <- NormalizeData(object)
+
+# Visualize gene expression
+p1 <- SpatialFeaturePlot(object, features = "Hpca") + 
+  ggtitle("Hpca expression (8um)")
+p1
+
+```
+
+4. Unsupervised Clustering with Sketching
+```{r}
+object <- FindVariableFeatures(object)
+object <- ScaleData(object)
+
+# Downsample for scalability
+object <- SketchData(
+  object = object,
+  ncells = 50000,
+  method = "LeverageScore",
+  sketched.assay = "sketch",
+  features = VariableFeatures(object)
+)
+
+# Switch to sketch assay
+DefaultAssay(object) <- "sketch"
+object <- FindVariableFeatures(object)
+object <- ScaleData(object)
+object <- RunPCA(object, assay = "sketch", reduction.name = "pca.sketch")
+object <- FindNeighbors(object, assay = "sketch", reduction = "pca.sketch", dims = 1:50)
+object <- FindClusters(object, cluster.name = "seurat_cluster.sketched", resolution = 3)
+object <- RunUMAP(object, reduction = "pca.sketch", reduction.name = "umap.sketch", return.model = TRUE, dims = 1:50)
+
+## Project Back to Full Resolution
+
+object <- ProjectData(
+  object = object,
+  assay = "Spatial",
+  full.reduction = "full.pca.sketch",
+  sketched.assay = "sketch",
+  sketched.reduction = "pca.sketch",
+  umap.model = "umap.sketch",
+  dims = 1:50,
+  refdata = list(seurat_cluster.projected = "seurat_cluster.sketched")
+)
+
+## Visualize Clustering
+
+# Sketched UMAP
+DefaultAssay(object) <- "sketch"
+Idents(object) <- "seurat_cluster.sketched"
+p1 <- DimPlot(object, reduction = "umap.sketch") + ggtitle("Sketched Clustering") + theme(legend.position = "bottom")
+
+# Full data UMAP
+DefaultAssay(object) <- "Spatial"
+Idents(object) <- "seurat_cluster.projected"
+p2 <- DimPlot(object, reduction = "full.umap.sketch") + ggtitle("Projected Clustering") + theme(legend.position = "bottom")
+
+p1 | p2
+
+## Spatial Visualization
+SpatialDimPlot(object, label = TRUE, repel = TRUE, label.size = 4)
+
+# Highlight specific clusters
+cells <- CellsByIdentities(object, idents = c(0, 4, 32, 34, 35))
+p <- SpatialDimPlot(object,
+                    cells.highlight = cells[setdiff(names(cells), "NA")],
+                    cols.highlight = c("#FFFF00", "grey50"),
+                    facet.highlight = TRUE, combine = TRUE
+) + NoLegend()
+p
+```
+
+5. Marker Gene Analysis
+
+```{r}
+object_subset <- subset(object, cells = Cells(object[["Spatial"]]), downsample = 1000)
+object_subset <- BuildClusterTree(object_subset, assay = "Spatial", reduction = "full.pca.sketch", reorder = TRUE)
+
+markers <- FindAllMarkers(object_subset, assay = "Spatial", only.pos = TRUE)
+top5 <- markers %>%
+  group_by(cluster) %>%
+  filter(avg_log2FC > 1) %>%
+  slice_head(n = 5)
+
+object_subset <- ScaleData(object_subset, assay = "Spatial", features = top5$gene)
+DoHeatmap(object_subset, assay = "Spatial", features = top5$gene, size = 2.5) + theme(axis.text = element_text(size = 5.5)) + NoLegend()
+
+```
+6. Identifying spatially-defined tissue domains
+While the previous analyses consider each bin independently, spatial data enables cells to be defined not just by their neighborhood, but also by their broader spatial context.
+
+In Singhal et al., the authors introduce BANKSY, Building Aggregates with a Neighborhood Kernel and Spatial Yardstick (BANKSY). BANKSY performs multiple tasks, but we find it particularly valuable for identifying and segmenting tissue domains. When performing clustering, BANKSY augments a spot’s expression pattern with both the mean and the gradient of gene expression levels in a spot’s broader neighborhood.
+
+```{r}
+# Install BANKSY and SeuratWrappers if needed
+#if (!requireNamespace("Banksy", quietly = TRUE)) {
+  remotes::install_github("prabhakarlab/Banksy@devel")
+#}
+#if (!requireNamespace("SeuratWrappers", quietly = TRUE)) {
+  remotes::install_github("satijalab/seurat-wrappers")
+#}
+
+
+library(Banksy)
+library(SeuratWrappers)
+
+object <- RunBanksy(object,
+                    lambda = 0.8, verbose = TRUE,
+                    assay = "Spatial", slot = "data", features = "variable",
+                    k_geom = 50)
+
+DefaultAssay(object) <- "BANKSY"
+object <- RunPCA(object, assay = "BANKSY", reduction.name = "pca.banksy", features = rownames(object), npcs = 30)
+object <- FindNeighbors(object, reduction = "pca.banksy", dims = 1:30)
+object <- FindClusters(object, cluster.name = "banksy_cluster", resolution = 0.5)
+
+## Visualize BANKSY Results
+
+Idents(object) <- "banksy_cluster"
+p <- SpatialDimPlot(object, group.by = "banksy_cluster", label = TRUE, repel = TRUE, label.size = 4)
+p
+
+banksy_cells <- CellsByIdentities(object)
+p <- SpatialDimPlot(object,
+                    cells.highlight = banksy_cells[setdiff(names(banksy_cells), "NA")],
+                    cols.highlight = c("#FFFF00", "grey50"),
+                    facet.highlight = TRUE, combine = TRUE
+) + NoLegend()
+p
+
+```
+
